@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# SSX - SSH Connection Manager
+
+set -euo pipefail
+
+SCRIPT_NAME="ssx"
+SCRIPT_VERSION="1.3.2"
+CONFIG_DIR="${HOME}/.config/ssx"
+CONFIG_FILE="${CONFIG_DIR}/servers.conf"
+SYSTEM_KNOWN_HOSTS="${HOME}/.ssh/known_hosts"
+
+# 颜色
+if [[ -t 1 ]] && command -v tput &>/dev/null && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
+    RED=$(tput setaf 1); GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3); BLUE=$(tput setaf 4); BOLD=$(tput bold); RESET=$(tput sgr0)
+else
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""
+fi
+
+log_info() { echo -e "${BLUE}[INFO]${RESET} $*" >&2; }
+log_success() { echo -e "${GREEN}[SUCCESS]${RESET} $*" >&2; }
+log_warn() { echo -e "${YELLOW}[WARN]${RESET} $*" >&2; }
+log_error() { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+
+initialize_config() {
+    [[ ! -d "${CONFIG_DIR}" ]] && { mkdir -p "${CONFIG_DIR}"; chmod 700 "${CONFIG_DIR}"; }
+    [[ ! -d "${HOME}/.ssh" ]] && { mkdir -p "${HOME}/.ssh"; chmod 700 "${HOME}/.ssh"; }
+    [[ ! -f "${SYSTEM_KNOWN_HOSTS}" ]] && { touch "${SYSTEM_KNOWN_HOSTS}"; chmod 600 "${SYSTEM_KNOWN_HOSTS}"; }
+
+    if [[ ! -f "${CONFIG_FILE}" ]]; then
+        cat > "${CONFIG_FILE}" << 'EOF'
+# SSX Server Config
+[notebook]
+ip = 192.168.110.230
+user = jssd
+EOF
+        chmod 600 "${CONFIG_FILE}"
+    fi
+}
+
+load_config() {
+    local server_alias="$1"
+    local in_section=false
+
+    unset SSX_IP SSX_USER SSX_KEY SSX_PASS_NAME SSX_PASSWORD
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "${line}" ]] || [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+
+        if [[ "${line}" =~ ^\[([a-zA-Z0-9_.-]+)\] ]]; then
+            [[ "${BASH_REMATCH[1]}" == "${server_alias}" ]] && in_section=true || in_section=false
+        elif [[ "${in_section}" == true && "${line}" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}"
+            value="${value#\"}"; value="${value%\"}"
+            case "${key}" in
+                ip) SSX_IP="${value}" ;;
+                user) SSX_USER="${value}" ;;
+                key) SSX_KEY="${value}" ;;
+                pass_name) SSX_PASS_NAME="${value}" ;;
+                password) SSX_PASSWORD="${value}" ;;
+            esac
+        fi
+    done < "${CONFIG_FILE}"
+
+    [[ -z "${SSX_IP:-}" ]] && { log_error "未配置IP"; return 1; }
+    [[ -z "${SSX_USER:-}" ]] && { log_error "未配置用户"; return 1; }
+    [[ -n "${SSX_KEY:-}" ]] && SSX_KEY="${SSX_KEY/#\~/${HOME}}"
+    return 0
+}
+
+detect_ssh_key() {
+    local user="$1"
+    local host="$2"
+
+    # 优先使用配置文件中的 key
+    if [[ -n "${SSX_KEY:-}" ]] && [[ -r "${SSX_KEY}" ]]; then
+        echo "${SSX_KEY}"
+        return 0
+    fi
+
+    # 自动检测 ~/.ssh/ 下的密钥
+    local key_files=("${HOME}/.ssh/id_ed25519" "${HOME}/.ssh/id_rsa" "${HOME}/.ssh/id_ecdsa")
+
+    for key_file in "${key_files[@]}"; do
+        if [[ -r "${key_file}" ]]; then
+            if ssh -o "StrictHostKeyChecking=accept-new" -o "BatchMode=yes" -o "ConnectTimeout=5" -i "${key_file}" "${user}@${host}" exit 2>/dev/null; then
+                echo "${key_file}"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+get_available_servers() {
+    [[ ! -f "${CONFIG_FILE}" ]] && return
+    grep -oP '^\[[a-zA-Z0-9_.-]+\]' "${CONFIG_FILE}" | sed 's/\[//;s/\]//' | sort
+}
+
+trust_host_key() {
+    local host="$1"
+    ssh-keygen -F "${host}" &>/dev/null && return 0
+    log_info "获取Host Key..."
+    local keyscan_output
+    keyscan_output=$(ssh-keyscan -t ed25519,rsa,ecdsa "${host}" 2>/dev/null) || return 1
+    [[ -z "${keyscan_output}" ]] && return 1
+    echo "${keyscan_output}" >> "${SYSTEM_KNOWN_HOSTS}"
+    ssh-keygen -F "${host}" &>/dev/null && { log_success "Host Key已信任"; return 0; }
+    return 1
+}
+
+show_help() {
+    cat << EOF
+${BOLD}SSX - SSH连接管理器${RESET}
+用法: ${SCRIPT_NAME} <服务器别名>
+     ${SCRIPT_NAME} --help
+     ${SCRIPT_NAME} --list
+可用服务器:
+EOF
+    get_available_servers | while read s; do echo "  - ${s}"; done
+}
+
+check_pass_init() {
+    [[ -d "${HOME}/.password-store" ]] && [[ -f "${HOME}/.password-store/.gpg-id" ]] && return 0
+    pass ls &>/dev/null 2>&1 && return 0
+    return 1
+}
+
+update_config_pass_name() {
+    local server_alias="$1"
+    local pass_name="$2"
+    [[ -z "${pass_name}" ]] && return 1
+
+    local line section_start end_line
+    line=$(grep -n "^\[${server_alias}\]" "${CONFIG_FILE}" | head -1)
+    [[ -z "${line}" ]] && return 1
+
+    section_start=$(echo "${line}" | cut -d: -f1)
+    end_line=$(awk -v start="${section_start}" 'NR>start && /^\[/ {print NR-1; exit} END {print NR}' "${CONFIG_FILE}")
+
+    if sed -n "${section_start},${end_line}p" "${CONFIG_FILE}" | grep -v "^[[:space:]]*#" | grep -q "^[[:space:]]*pass_name[[:space:]]*="; then
+        sed -i "${section_start},${end_line}s|^[[:space:]]*pass_name[[:space:]]*=.*|pass_name = ${pass_name}|" "${CONFIG_FILE}"
+    else
+        sed -i "${end_line}a\\pass_name = ${pass_name}" "${CONFIG_FILE}"
+    fi
+
+    log_success "已更新配置: pass_name = ${pass_name}"
+    return 0
+}
+
+get_password() {
+    local pass_name="$1"
+    local server_alias="$2"
+    local password=""
+    local newline=$'\n'
+    local just_saved=false
+
+    # 1. 从pass获取
+    if command -v pass &>/dev/null && [[ -n "${pass_name}" ]]; then
+        log_info "从pass获取密码..."
+        password=$(pass show "${pass_name}" 2>/dev/null)
+        if [[ -n "${password}" ]]; then
+            password="${password%%${newline}*}"
+            log_success "获取成功"
+            printf '%s' "${password}"
+            return 0
+        fi
+    fi
+
+    # 2. 明文密码
+    if [[ -n "${SSX_PASSWORD:-}" ]]; then
+        log_warn "警告: 明文密码"
+        printf '%s' "${SSX_PASSWORD}"
+        return 0
+    fi
+
+    # 3. 交互式输入
+    while true; do
+        printf "密码: " >&2
+        IFS= read -rs password
+        echo "" >&2
+        [[ -n "${password}" ]] && break
+        log_error "不能为空" >&2
+    done
+
+    echo -n "保存到pass？(y/N): " >&2
+    read -r save_choice
+
+    if [[ "${save_choice}" == "y" || "${save_choice}" == "Y" ]]; then
+        if command -v pass &>/dev/null && check_pass_init; then
+            echo -n "pass名称 [servers/${server_alias}]: " >&2
+            read -r pass_entry
+            pass_entry="${pass_entry:-servers/${server_alias}}"
+
+            if echo "${password}" | pass insert -m "${pass_entry}" 2>&1; then
+                log_success "已保存: ${pass_entry}"
+                update_config_pass_name "${server_alias}" "${pass_entry}"
+                just_saved=true
+            fi
+        fi
+    fi
+
+    if [[ "${just_saved}" == true ]]; then
+        log_warn "密码已保存！请再次运行 'ssx ${server_alias}'"
+        exit 0
+    fi
+
+    printf '%s' "${password}"
+    return 0
+}
+
+connect_to_server() {
+    local server_alias="$1"
+    local password
+
+    log_info "加载配置: ${server_alias}"
+    load_config "${server_alias}" || return 1
+
+    log_info "连接: ${SSX_USER}@${SSX_IP}"
+    trust_host_key "${SSX_IP}"
+
+    # 尝试证书登录
+    local detected_key
+    if detected_key=$(detect_ssh_key "${SSX_USER}" "${SSX_IP}"); then
+        log_info "使用SSH证书: ${detected_key}"
+        log_success "证书认证成功"
+        exec ssh -o "StrictHostKeyChecking=accept-new" -i "${detected_key}" "${SSX_USER}@${SSX_IP}"
+    fi
+
+    # 密码登录
+    log_info "无证书，使用密码认证"
+    password=$(get_password "${SSX_PASS_NAME:-}" "${server_alias}") || return 1
+    [[ -z "${password}" ]] && return 1
+
+    command -v sshpass &>/dev/null || { log_error "需要安装sshpass"; return 1; }
+
+    log_info "连接中..."
+    local result
+    result=$(sshpass -p "${password}" ssh -o "StrictHostKeyChecking=accept-new" -o "ConnectTimeout=15" -o "UserKnownHostsFile=${SYSTEM_KNOWN_HOSTS}" -o "LogLevel=ERROR" "${SSX_USER}@${SSX_IP}" "echo OK" 2>&1)
+
+    if [[ "${result}" == "OK" ]]; then
+        log_success "连接成功"
+        exec sshpass -p "${password}" ssh -o "StrictHostKeyChecking=accept-new" -o "UserKnownHostsFile=${SYSTEM_KNOWN_HOSTS}" "${SSX_USER}@${SSX_IP}"
+    else
+        log_error "连接失败: ${result}"
+        return 1
+    fi
+}
+
+main() {
+    initialize_config
+
+    case "${1:-}" in
+        --help|-h|"") show_help; exit 0 ;;
+        --list|-l) get_available_servers | while read s; do echo "- ${s}"; done; exit 0 ;;
+        -*) log_error "未知选项: $1"; exit 1 ;;
+        *) connect_to_server "$1"; exit $? ;;
+    esac
+}
+
+main "$@"
