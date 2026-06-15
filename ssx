@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # SSX - SSH Connection Manager
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_NAME="ssx"
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="2.0.0"
 CONFIG_DIR="${HOME}/.config/ssx"
 CONFIG_FILE="${CONFIG_DIR}/servers.conf"
 SYSTEM_KNOWN_HOSTS="${HOME}/.ssh/known_hosts"
 
-# 颜色
-if [[ -t 1 ]] && command -v tput &>/dev/null && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
-    RED=$(tput setaf 1); GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3); BLUE=$(tput setaf 4); BOLD=$(tput bold); RESET=$(tput sgr0)
+# 颜色: 仅检测终端是否为TTY
+if [[ -t 1 ]]; then
+    RED=$(tput setaf 1 2>/dev/null) || RED=""
+    GREEN=$(tput setaf 2 2>/dev/null) || GREEN=""
+    YELLOW=$(tput setaf 3 2>/dev/null) || YELLOW=""
+    BLUE=$(tput setaf 4 2>/dev/null) || BLUE=""
+    BOLD=$(tput bold 2>/dev/null) || BOLD=""
+    RESET=$(tput sgr0 2>/dev/null) || RESET=""
 else
-    RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""
+    RED="" GREEN="" YELLOW="" BLUE="" BOLD="" RESET=""
 fi
 
 log_info() { echo -e "${BLUE}[INFO]${RESET} $*" >&2; }
@@ -22,10 +27,18 @@ log_warn() { echo -e "${YELLOW}[WARN]${RESET} $*" >&2; }
 log_error() { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 
 initialize_config() {
-    [[ ! -d "${CONFIG_DIR}" ]] && { mkdir -p "${CONFIG_DIR}"; chmod 700 "${CONFIG_DIR}"; }
-    [[ ! -d "${HOME}/.ssh" ]] && { mkdir -p "${HOME}/.ssh"; chmod 700 "${HOME}/.ssh"; }
-    [[ ! -f "${SYSTEM_KNOWN_HOSTS}" ]] && { touch "${SYSTEM_KNOWN_HOSTS}"; chmod 600 "${SYSTEM_KNOWN_HOSTS}"; }
-
+    if [[ ! -d "${CONFIG_DIR}" ]]; then
+        mkdir -p "${CONFIG_DIR}"
+        chmod 700 "${CONFIG_DIR}"
+    fi
+    if [[ ! -d "${HOME}/.ssh" ]]; then
+        mkdir -p "${HOME}/.ssh"
+        chmod 700 "${HOME}/.ssh"
+    fi
+    if [[ ! -f "${SYSTEM_KNOWN_HOSTS}" ]]; then
+        touch "${SYSTEM_KNOWN_HOSTS}"
+        chmod 600 "${SYSTEM_KNOWN_HOSTS}"
+    fi
     if [[ ! -f "${CONFIG_FILE}" ]]; then
         cat > "${CONFIG_FILE}" << 'EOF'
 # SSX Server Config
@@ -41,27 +54,54 @@ load_config() {
     local server_alias="$1"
     local in_section=false
 
-    unset SSX_IP SSX_USER SSX_KEY SSX_PASS_NAME SSX_PASSWORD
+    unset SSX_IP SSX_USER SSX_KEY SSX_PASS_NAME SSX_PASSWORD SSX_PORT SSX_EXTRA_OPTS
 
     while IFS= read -r line || [[ -n "${line}" ]]; do
+        # 去除前后空白
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
-        [[ -z "${line}" ]] || [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line}" || "${line}" == \#* ]] && continue
 
         if [[ "${line}" =~ ^\[([a-zA-Z0-9_.-]+)\] ]]; then
-            [[ "${BASH_REMATCH[1]}" == "${server_alias}" ]] && in_section=true || in_section=false
-        elif [[ "${in_section}" == true && "${line}" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-            local key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}"
-            value="${value#\"}"; value="${value%\"}"
-            case "${key}" in
-                ip) SSX_IP="${value}" ;;
-                user) SSX_USER="${value}" ;;
-                key) SSX_KEY="${value}" ;;
-                pass_name) SSX_PASS_NAME="${value}" ;;
-                password) SSX_PASSWORD="${value}" ;;
-            esac
+            if [[ "${BASH_REMATCH[1]}" == "${server_alias}" ]]; then
+                in_section=true
+            else
+                in_section=false
+            fi
+        elif [[ "${in_section}" == true ]]; then
+            # 支持值中包含等号: password = abc=def
+            if [[ "${line}" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*) ]]; then
+                local key="${BASH_REMATCH[1]}"
+                local value="${BASH_REMATCH[2]}"
+                # 去除值尾部空白
+                value="${value%"${value##*[![:space:]]}"}"
+                # 去除首尾引号
+                value="${value#\"}"; value="${value%\"}"
+                case "${key}" in
+                    ip) SSX_IP="${value}" ;;
+                    user) SSX_USER="${value}" ;;
+                    key) SSX_KEY="${value}" ;;
+                    pass_name) SSX_PASS_NAME="${value}" ;;
+                    password) SSX_PASSWORD="${value}" ;;
+                    port) SSX_PORT="${value}" ;;
+                    extra_opts) SSX_EXTRA_OPTS="${value}" ;;
+                esac
+            fi
         fi
     done < "${CONFIG_FILE}"
+
+    # 端口默认值和校验
+    if [[ -n "${SSX_PORT:-}" ]]; then
+        if ! [[ "${SSX_PORT}" =~ ^[0-9]+$ ]]; then
+            log_error "端口无效: ${SSX_PORT}"
+            return 1
+        fi
+    else
+        SSX_PORT="22"
+    fi
+
+    # extra_opts 默认值
+    : "${SSX_EXTRA_OPTS:=}"
 
     [[ -z "${SSX_IP:-}" ]] && { log_error "未配置IP"; return 1; }
     [[ -z "${SSX_USER:-}" ]] && { log_error "未配置用户"; return 1; }
@@ -70,24 +110,21 @@ load_config() {
 }
 
 detect_ssh_key() {
-    local user="$1"
-    local host="$2"
-
-    # 优先使用配置文件中的 key
-    if [[ -n "${SSX_KEY:-}" ]] && [[ -r "${SSX_KEY}" ]]; then
-        echo "${SSX_KEY}"
-        return 0
+    # 优先使用配置文件中的 key, 验证密钥格式
+    if [[ -n "${SSX_KEY:-}" && -r "${SSX_KEY}" ]]; then
+        if ssh-keygen -l -f "${SSX_KEY}" &>/dev/null; then
+            echo "${SSX_KEY}"
+            return 0
+        fi
     fi
 
-    # 自动检测 ~/.ssh/ 下的密钥
+    # 自动检测: 检查私钥可读且格式有效
     local key_files=("${HOME}/.ssh/id_ed25519" "${HOME}/.ssh/id_rsa" "${HOME}/.ssh/id_ecdsa")
-
+    local key_file
     for key_file in "${key_files[@]}"; do
-        if [[ -r "${key_file}" ]]; then
-            if ssh -o "StrictHostKeyChecking=accept-new" -o "BatchMode=yes" -o "ConnectTimeout=5" -i "${key_file}" "${user}@${host}" exit 2>/dev/null; then
-                echo "${key_file}"
-                return 0
-            fi
+        if [[ -r "${key_file}" ]] && ssh-keygen -l -f "${key_file}" &>/dev/null; then
+            echo "${key_file}"
+            return 0
         fi
     done
 
@@ -95,36 +132,81 @@ detect_ssh_key() {
 }
 
 get_available_servers() {
-    [[ ! -f "${CONFIG_FILE}" ]] && return
+    [[ ! -f "${CONFIG_FILE}" ]] && return 0
     grep -oP '^\[[a-zA-Z0-9_.-]+\]' "${CONFIG_FILE}" | sed 's/\[//;s/\]//' | sort
+}
+
+list_servers() {
+    [[ ! -f "${CONFIG_FILE}" ]] && return 0
+    printf "%-15s %-25s %s\n" "别名" "地址" "用户"
+    printf "%-15s %-25s %s\n" "----" "----" "----"
+    awk '
+        /^\[/ {
+            if (alias != "") {
+                port = (port != "") ? port : "22"
+                printf "%-15s %-25s %s\n", alias, ip ":" port, user
+            }
+            gsub(/[\[\]]/, "")
+            alias = $0; ip = ""; user = ""; port = ""
+        }
+        /^[[:space:]]*ip[[:space:]]*=/ {
+            sub(/^[[:space:]]*ip[[:space:]]*=[[:space:]]*/, "")
+            ip = $0
+        }
+        /^[[:space:]]*user[[:space:]]*=/ {
+            sub(/^[[:space:]]*user[[:space:]]*=[[:space:]]*/, "")
+            user = $0
+        }
+        /^[[:space:]]*port[[:space:]]*=/ {
+            sub(/^[[:space:]]*port[[:space:]]*=[[:space:]]*/, "")
+            port = $0
+        }
+        END {
+            if (alias != "") {
+                port = (port != "") ? port : "22"
+                printf "%-15s %-25s %s\n", alias, ip ":" port, user
+            }
+        }
+    ' "${CONFIG_FILE}"
 }
 
 trust_host_key() {
     local host="$1"
-    ssh-keygen -F "${host}" &>/dev/null && return 0
+    ssh-keygen -F "${host}" >/dev/null 2>&1 && return 0
     log_info "获取Host Key..."
     local keyscan_output
     keyscan_output=$(ssh-keyscan -t ed25519,rsa,ecdsa "${host}" 2>/dev/null) || return 1
     [[ -z "${keyscan_output}" ]] && return 1
     echo "${keyscan_output}" >> "${SYSTEM_KNOWN_HOSTS}"
-    ssh-keygen -F "${host}" &>/dev/null && { log_success "Host Key已信任"; return 0; }
+    ssh-keygen -F "${host}" >/dev/null 2>&1 && { log_success "Host Key已信任"; return 0; }
     return 1
 }
 
 show_help() {
     cat << EOF
-${BOLD}SSX - SSH连接管理器${RESET}
+${BOLD}SSX - SSH连接管理器 v${SCRIPT_VERSION}${RESET}
 用法: ${SCRIPT_NAME} <服务器别名>
-     ${SCRIPT_NAME} --help
-     ${SCRIPT_NAME} --list
+      ${SCRIPT_NAME} <服务器别名> -u
+      ${SCRIPT_NAME} --help
+      ${SCRIPT_NAME} --list
+      ${SCRIPT_NAME} add <别名> <IP> <用户> [-p 端口] [-k 密钥路径]
+      ${SCRIPT_NAME} remove <别名>
+
+命令:
+  add       添加服务器配置
+  remove    删除服务器配置
+
+选项:
+  -u        上传SSH密钥到服务器(ssh-copy-id)
+
 可用服务器:
 EOF
-    get_available_servers | while read s; do echo "  - ${s}"; done
+    get_available_servers | while read -r s; do echo "  - ${s}"; done
 }
 
 check_pass_init() {
-    [[ -d "${HOME}/.password-store" ]] && [[ -f "${HOME}/.password-store/.gpg-id" ]] && return 0
-    pass ls &>/dev/null 2>&1 && return 0
+    [[ -d "${HOME}/.password-store" && -f "${HOME}/.password-store/.gpg-id" ]] && return 0
+    pass ls &>/dev/null && return 0
     return 1
 }
 
@@ -133,20 +215,60 @@ update_config_pass_name() {
     local pass_name="$2"
     [[ -z "${pass_name}" ]] && return 1
 
-    local line section_start end_line
-    line=$(grep -n "^\[${server_alias}\]" "${CONFIG_FILE}" | head -1)
-    [[ -z "${line}" ]] && return 1
-
-    section_start=$(echo "${line}" | cut -d: -f1)
-    end_line=$(awk -v start="${section_start}" 'NR>start && /^\[/ {print NR-1; exit} END {print NR}' "${CONFIG_FILE}")
-
-    if sed -n "${section_start},${end_line}p" "${CONFIG_FILE}" | grep -v "^[[:space:]]*#" | grep -q "^[[:space:]]*pass_name[[:space:]]*="; then
-        sed -i "${section_start},${end_line}s|^[[:space:]]*pass_name[[:space:]]*=.*|pass_name = ${pass_name}|" "${CONFIG_FILE}"
-    else
-        sed -i "${end_line}a\\pass_name = ${pass_name}" "${CONFIG_FILE}"
-    fi
-
+    # 使用 awk 精确处理, 避免 sed 边界 bug
+    local tmpfile
+    tmpfile=$(mktemp)
+    awk -v alias="${server_alias}" -v pname="${pass_name}" '
+        BEGIN { in_sec = 0; found = 0 }
+        /^\[/ {
+            if (in_sec && !found) { print "pass_name = " pname }
+            in_sec = ($0 == "[" alias "]")
+            found = 0
+        }
+        in_sec && /^[[:space:]]*pass_name[[:space:]]*=/ {
+            print "pass_name = " pname
+            found = 1
+            next
+        }
+        { print }
+        END {
+            if (in_sec && !found) { print "pass_name = " pname }
+        }
+    ' "${CONFIG_FILE}" > "${tmpfile}"
+    mv "${tmpfile}" "${CONFIG_FILE}"
+    chmod 600 "${CONFIG_FILE}"
     log_success "已更新配置: pass_name = ${pass_name}"
+    return 0
+}
+
+update_config_key() {
+    local server_alias="$1"
+    local key_path="$2"
+    [[ -z "${key_path}" ]] && return 1
+
+    # 使用 awk 精确处理
+    local tmpfile
+    tmpfile=$(mktemp)
+    awk -v alias="${server_alias}" -v kpath="${key_path}" '
+        BEGIN { in_sec = 0; found = 0 }
+        /^\[/ {
+            if (in_sec && !found) { print "key = " kpath }
+            in_sec = ($0 == "[" alias "]")
+            found = 0
+        }
+        in_sec && /^[[:space:]]*key[[:space:]]*=/ {
+            print "key = " kpath
+            found = 1
+            next
+        }
+        { print }
+        END {
+            if (in_sec && !found) { print "key = " kpath }
+        }
+    ' "${CONFIG_FILE}" > "${tmpfile}"
+    mv "${tmpfile}" "${CONFIG_FILE}"
+    chmod 600 "${CONFIG_FILE}"
+    log_success "已更新配置: key = ${key_path}"
     return 0
 }
 
@@ -155,14 +277,13 @@ get_password() {
     local server_alias="$2"
     local password=""
     local newline=$'\n'
-    local just_saved=false
 
-    # 1. 从pass获取
+    # 1. 从 pass 获取
     if command -v pass &>/dev/null && [[ -n "${pass_name}" ]]; then
         log_info "从pass获取密码..."
-        password=$(pass show "${pass_name}" 2>/dev/null)
+        password=$(pass show "${pass_name}" 2>/dev/null) || true
         if [[ -n "${password}" ]]; then
-            password="${password%%${newline}*}"
+            password="${password%%"${newline}"*}"
             log_success "获取成功"
             printf '%s' "${password}"
             return 0
@@ -177,34 +298,41 @@ get_password() {
     fi
 
     # 3. 交互式输入
+    local save_to_pass=false
+    local pass_entry=""
+
+    echo -n "保存密码到pass? (y/N): " >&2
+    read -r save_choice
+
+    if [[ "${save_choice}" == "y" || "${save_choice}" == "Y" ]]; then
+        if command -v pass &>/dev/null && check_pass_init; then
+            save_to_pass=true
+            echo -n "pass名称 [servers/${server_alias}]: " >&2
+            read -r pass_entry
+            pass_entry="${pass_entry:-servers/${server_alias}}"
+        elif command -v pass &>/dev/null; then
+            log_warn "pass已安装但未初始化, 无法保存. 请执行: pass init <GPG密钥ID>"
+        else
+            log_warn "pass未安装, 无法保存. 请执行: sudo apt install pass && pass init <GPG密钥ID>"
+        fi
+    fi
+
     while true; do
         printf "密码: " >&2
         IFS= read -rs password
         echo "" >&2
         [[ -n "${password}" ]] && break
-        log_error "不能为空" >&2
+        log_error "不能为空"
     done
 
-    echo -n "保存到pass？(y/N): " >&2
-    read -r save_choice
-
-    if [[ "${save_choice}" == "y" || "${save_choice}" == "Y" ]]; then
-        if command -v pass &>/dev/null && check_pass_init; then
-            echo -n "pass名称 [servers/${server_alias}]: " >&2
-            read -r pass_entry
-            pass_entry="${pass_entry:-servers/${server_alias}}"
-
-            if echo "${password}" | pass insert -m "${pass_entry}" 2>&1; then
-                log_success "已保存: ${pass_entry}"
-                update_config_pass_name "${server_alias}" "${pass_entry}"
-                just_saved=true
-            fi
+    # 输入密码后执行pass保存
+    if [[ "${save_to_pass}" == true ]]; then
+        if echo "${password}" | pass insert -m "${pass_entry}" 2>&1; then
+            log_success "已保存: ${pass_entry}"
+            update_config_pass_name "${server_alias}" "${pass_entry}"
+        else
+            log_error "保存到pass失败"
         fi
-    fi
-
-    if [[ "${just_saved}" == true ]]; then
-        log_warn "密码已保存！请再次运行 'ssx ${server_alias}'"
-        exit 0
     fi
 
     printf '%s' "${password}"
@@ -218,33 +346,265 @@ connect_to_server() {
     log_info "加载配置: ${server_alias}"
     load_config "${server_alias}" || return 1
 
-    log_info "连接: ${SSX_USER}@${SSX_IP}"
+    log_info "连接: ${SSX_USER}@${SSX_IP}:${SSX_PORT}"
     trust_host_key "${SSX_IP}"
+
+    # 禁止危险SSH选项
+    if [[ -n "${SSX_EXTRA_OPTS}" ]]; then
+        if echo "${SSX_EXTRA_OPTS}" | grep -qiE '(Proxy|Local|Remote)Command|PermitLocalCommand|IdentityAgent|PKCS11|SecurityKey|ControlPath|ControlCommand'; then
+            log_error "extra_opts 包含不安全的 SSH 选项"
+            return 1
+        fi
+    fi
+
+    # 解析额外参数为数组
+    local ssh_extra=()
+    if [[ -n "${SSX_EXTRA_OPTS}" ]]; then
+        read -ra ssh_extra <<< "${SSX_EXTRA_OPTS}"
+    fi
 
     # 尝试证书登录
     local detected_key
     if detected_key=$(detect_ssh_key "${SSX_USER}" "${SSX_IP}"); then
-        log_info "使用SSH证书: ${detected_key}"
-        log_success "证书认证成功"
-        exec ssh -o "StrictHostKeyChecking=accept-new" -i "${detected_key}" "${SSX_USER}@${SSX_IP}"
+        log_info "尝试密钥: ${detected_key}"
+        # 先测试密钥是否被服务器接受
+        local key_test
+        key_test=$(ssh -o "StrictHostKeyChecking=accept-new" \
+            -o "ConnectTimeout=15" \
+            -o "BatchMode=yes" \
+            -o "LogLevel=ERROR" \
+            -p "${SSX_PORT}" -i "${detected_key}" \
+            "${SSX_USER}@${SSX_IP}" "echo OK" 2>&1)
+        if [[ "${key_test}" == "OK" ]]; then
+            log_success "密钥认证成功"
+            if [[ ${#ssh_extra[@]} -gt 0 ]]; then
+                exec ssh -o "StrictHostKeyChecking=accept-new" \
+                    -p "${SSX_PORT}" -i "${detected_key}" \
+                    "${ssh_extra[@]}" "${SSX_USER}@${SSX_IP}"
+            else
+                exec ssh -o "StrictHostKeyChecking=accept-new" \
+                    -p "${SSX_PORT}" -i "${detected_key}" \
+                    "${SSX_USER}@${SSX_IP}"
+            fi
+        fi
+        # 密钥不被接受, fallback 到密码登录
+        log_warn "密钥未被服务器接受, 尝试密码认证"
     fi
 
     # 密码登录
-    log_info "无证书，使用密码认证"
+    if [[ -n "${detected_key:-}" ]]; then
+        log_info "密钥未被接受, 使用密码认证"
+    else
+        log_info "无密钥, 使用密码认证"
+    fi
     password=$(get_password "${SSX_PASS_NAME:-}" "${server_alias}") || return 1
     [[ -z "${password}" ]] && return 1
 
     command -v sshpass &>/dev/null || { log_error "需要安装sshpass"; return 1; }
 
-    log_info "连接中..."
+    # 使用临时文件传递密码, 避免环境变量泄露到子进程
+    local pass_file
+    pass_file=$(mktemp)
+    chmod 600 "${pass_file}"
+    printf '%s' "${password}" > "${pass_file}"
+    unset password
+
+    local max_retries=2
+    local attempt=0
     local result
-    result=$(sshpass -p "${password}" ssh -o "StrictHostKeyChecking=accept-new" -o "ConnectTimeout=15" -o "UserKnownHostsFile=${SYSTEM_KNOWN_HOSTS}" -o "LogLevel=ERROR" "${SSX_USER}@${SSX_IP}" "echo OK" 2>&1)
+    while [[ ${attempt} -le ${max_retries} ]]; do
+        if [[ ${attempt} -gt 0 ]]; then
+            log_warn "连接失败, 重试中... (${attempt}/${max_retries})"
+        fi
+        result=$(sshpass -f "${pass_file}" ssh \
+            -o "StrictHostKeyChecking=accept-new" \
+            -o "ConnectTimeout=15" \
+            -o "UserKnownHostsFile=${SYSTEM_KNOWN_HOSTS}" \
+            -o "LogLevel=ERROR" \
+            -p "${SSX_PORT}" \
+            "${SSX_USER}@${SSX_IP}" "echo OK" 2>&1)
+        if [[ "${result}" == "OK" ]]; then
+            break
+        fi
+        attempt=$((attempt + 1))
+    done
 
     if [[ "${result}" == "OK" ]]; then
         log_success "连接成功"
-        exec sshpass -p "${password}" ssh -o "StrictHostKeyChecking=accept-new" -o "UserKnownHostsFile=${SYSTEM_KNOWN_HOSTS}" "${SSX_USER}@${SSX_IP}"
+        if [[ ${#ssh_extra[@]} -gt 0 ]]; then
+            exec sshpass -f "${pass_file}" ssh \
+                -o "StrictHostKeyChecking=accept-new" \
+                -o "UserKnownHostsFile=${SYSTEM_KNOWN_HOSTS}" \
+                -p "${SSX_PORT}" \
+                "${ssh_extra[@]}" "${SSX_USER}@${SSX_IP}"
+        else
+            exec sshpass -f "${pass_file}" ssh \
+                -o "StrictHostKeyChecking=accept-new" \
+                -o "UserKnownHostsFile=${SYSTEM_KNOWN_HOSTS}" \
+                -p "${SSX_PORT}" \
+                "${SSX_USER}@${SSX_IP}"
+        fi
     else
         log_error "连接失败: ${result}"
+        rm -f "${pass_file}"
+        return 1
+    fi
+}
+
+add_server() {
+    local alias="$1" ip="$2" user="$3"
+    shift 3
+    local port="22" key=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p) port="$2"; shift 2 ;;
+            -k) key="$2"; shift 2 ;;
+            *) log_error "未知参数: $1"; return 1 ;;
+        esac
+    done
+
+    # 验证别名
+    if ! [[ "${alias}" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        log_error "别名格式无效: 只能包含字母、数字、点、下划线、连字符"
+        return 1
+    fi
+    # 验证IP/主机
+    if ! [[ "${ip}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        log_error "IP/主机名格式无效"
+        return 1
+    fi
+    # 验证用户
+    if ! [[ "${user}" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        log_error "用户名格式无效"
+        return 1
+    fi
+    # 验证端口
+    if ! [[ "${port}" =~ ^[0-9]+$ ]] || [[ "${port}" -lt 1 ]] || [[ "${port}" -gt 65535 ]]; then
+        log_error "端口无效: 必须是 1-65535"
+        return 1
+    fi
+
+    # 检查别名是否已存在
+    if grep -q "^\[${alias}\]" "${CONFIG_FILE}" 2>/dev/null; then
+        log_error "别名已存在: ${alias}"
+        return 1
+    fi
+
+    # 追加新 section
+    {
+        echo ""
+        echo "[${alias}]"
+        echo "ip = ${ip}"
+        echo "user = ${user}"
+        [[ "${port}" != "22" ]] && echo "port = ${port}"
+        [[ -n "${key}" ]] && echo "key = ${key}"
+    } >> "${CONFIG_FILE}"
+
+    log_success "已添加服务器: ${alias} (${user}@${ip}:${port})"
+    return 0
+}
+
+remove_server() {
+    local alias="$1"
+
+    if ! grep -q "^\[${alias}\]" "${CONFIG_FILE}" 2>/dev/null; then
+        log_error "别名不存在: ${alias}"
+        return 1
+    fi
+
+    # 使用 awk 精确删除 section 块
+    local tmpfile
+    tmpfile=$(mktemp)
+    awk -v alias="${alias}" '
+        /^\[/ {
+            if ($0 == "[" alias "]") { skip = 1; next }
+            skip = 0
+        }
+        skip { next }
+        { print }
+    ' "${CONFIG_FILE}" > "${tmpfile}"
+    mv "${tmpfile}" "${CONFIG_FILE}"
+    chmod 600 "${CONFIG_FILE}"
+
+    log_success "已删除服务器: ${alias}"
+    return 0
+}
+
+upload_key() {
+    local server_alias="$1"
+
+    log_info "加载配置: ${server_alias}"
+    load_config "${server_alias}" || return 1
+
+    log_info "上传密钥到: ${SSX_USER}@${SSX_IP}:${SSX_PORT}"
+    trust_host_key "${SSX_IP}"
+
+    # 检测或生成本地密钥
+    local key_to_upload
+    if key_to_upload=$(detect_ssh_key "${SSX_USER}" "${SSX_IP}"); then
+        log_info "使用现有密钥: ${key_to_upload}"
+    else
+        # 本地无密钥, 生成 ed25519
+        echo -n "本地无SSH密钥, 是否生成? (y/N): " >&2
+        read -r gen_choice
+        if [[ "${gen_choice}" != "y" && "${gen_choice}" != "Y" ]]; then
+            log_error "需要密钥才能上传"
+            return 1
+        fi
+        key_to_upload="${HOME}/.ssh/id_ed25519"
+        if ! ssh-keygen -t ed25519 -f "${key_to_upload}" -N "" -q; then
+            log_error "密钥生成失败"
+            return 1
+        fi
+        log_success "密钥已生成: ${key_to_upload}"
+    fi
+
+    # 获取密码用于 ssh-copy-id
+    local password
+    command -v sshpass &>/dev/null || { log_error "需要安装sshpass"; return 1; }
+
+    password=$(get_password "${SSX_PASS_NAME:-}" "${server_alias}") || return 1
+    [[ -z "${password}" ]] && { log_error "需要密码才能上传密钥"; return 1; }
+
+    local pass_file
+    pass_file=$(mktemp)
+    chmod 600 "${pass_file}"
+    printf '%s' "${password}" > "${pass_file}"
+    unset password
+
+    # 上传密钥
+    if sshpass -f "${pass_file}" ssh-copy-id \
+        -o "StrictHostKeyChecking=accept-new" \
+        -o "UserKnownHostsFile=${SYSTEM_KNOWN_HOSTS}" \
+        -i "${key_to_upload}" \
+        -p "${SSX_PORT}" \
+        "${SSX_USER}@${SSX_IP}" 2>&1; then
+        rm -f "${pass_file}"
+        log_success "密钥已上传"
+
+        # 验证密钥登录是否可用
+        local key_verify
+        key_verify=$(ssh -o "StrictHostKeyChecking=accept-new" \
+            -o "ConnectTimeout=15" \
+            -o "BatchMode=yes" \
+            -o "LogLevel=ERROR" \
+            -p "${SSX_PORT}" -i "${key_to_upload}" \
+            "${SSX_USER}@${SSX_IP}" "echo OK" 2>&1)
+        if [[ "${key_verify}" == "OK" ]]; then
+            log_success "密钥登录验证成功, 下次可直接密钥登录"
+        else
+            log_warn "密钥登录验证失败, 服务器可能禁用了PubkeyAuthentication"
+            log_warn "请在服务器上执行: grep PubkeyAuthentication /etc/ssh/sshd_config"
+            log_warn "确认 PubkeyAuthentication yes 后执行: systemctl restart sshd"
+        fi
+
+        # 更新配置文件中的 key
+        update_config_key "${server_alias}" "${key_to_upload}"
+        return 0
+    else
+        rm -f "${pass_file}"
+        log_error "密钥上传失败"
         return 1
     fi
 }
@@ -253,10 +613,54 @@ main() {
     initialize_config
 
     case "${1:-}" in
-        --help|-h|"") show_help; exit 0 ;;
-        --list|-l) get_available_servers | while read s; do echo "- ${s}"; done; exit 0 ;;
-        -*) log_error "未知选项: $1"; exit 1 ;;
-        *) connect_to_server "$1"; exit $? ;;
+        --help|-h|"")
+            show_help
+            exit 0
+            ;;
+        --list|-l)
+            list_servers
+            exit 0
+            ;;
+        add)
+            shift
+            if [[ $# -lt 3 ]]; then
+                log_error "用法: ssx add <别名> <IP> <用户> [-p 端口] [-k 密钥路径]"
+                exit 1
+            fi
+            add_server "$@"
+            exit $?
+            ;;
+        remove)
+            shift
+            if [[ $# -lt 1 ]]; then
+                log_error "用法: ssx remove <别名>"
+                exit 1
+            fi
+            remove_server "$1"
+            exit $?
+            ;;
+        -u)
+            # ssx -u <别名>
+            if [[ -z "${2:-}" ]]; then
+                log_error "用法: ssx <别名> -u"
+                exit 1
+            fi
+            upload_key "$2"
+            exit $?
+            ;;
+        -*)
+            log_error "未知选项: $1"
+            exit 1
+            ;;
+        *)
+            # 支持 ssx <别名> -u 格式
+            if [[ "${2:-}" == "-u" ]]; then
+                upload_key "$1"
+                exit $?
+            fi
+            connect_to_server "$1"
+            exit $?
+            ;;
     esac
 }
 
